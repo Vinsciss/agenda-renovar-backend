@@ -59,6 +59,7 @@ app.post('/enviar-notificacao', async (req, res) => {
 
 // Rota de teste para ver se o servidor está online
 
+
 // ==========================================
 // ⏰ ROTAS DE CRON JOBS (LEMBRETES INTELIGENTES)
 // ==========================================
@@ -94,7 +95,7 @@ app.get('/cron/lembretes-escalas', async (req, res) => {
       }
 
       t.usuarios.forEach(user => {
-         const key = ${user}__;
+         const key = `${user}_${t.eventoId || t.eventoNome}_${t.data}`;
          if (!lembretes[key]) {
              lembretes[key] = { usuario: user, eventoNome: t.eventoNome || "Evento", data: t.data, hora: t.hora, funcoes: [] };
          }
@@ -113,9 +114,11 @@ app.get('/cron/lembretes-escalas', async (req, res) => {
        else if (info.data === amanhaStr) prefixoTempo = "É Amanhã! ⏳";
        else if (info.data === semanaStr) prefixoTempo = "Falta 1 semana! 📅";
 
-       const titulo = ${prefixoTempo} ;
+       const titulo = `${prefixoTempo} ${info.eventoNome}`;
        const funcStr = info.funcoes.join(", ");
-       const corpo = Lembrete da sua escala:\n📍 Funções: \n⏰ Horário: ;
+       const corpo = `Lembrete da sua escala:
+📍 Funções: ${funcStr}
+⏰ Horário: ${info.hora || '--:--'}`;
 
        const snapUser = await usuariosRef.where('nome', '==', info.usuario).get();
        let fcmToken = null;
@@ -157,7 +160,7 @@ app.get('/cron/lembretes-trocas', async (req, res) => {
       const destino = t.solicitantes && t.solicitantes[0] ? t.solicitantes[0].destino : null;
 
       const titulo = "⏳ Lembrete de Troca Pendente";
-      const corpo = O pedido de troca de  para a função  no dia  continua aguardando resposta!;
+      const corpo = `O pedido de troca de ${solicitante} para a função ${t.nome} no dia ${t.data.split('-').reverse().join('/')} continua aguardando resposta!`;
 
       promises.push((async () => {
          let tokensTarget = [];
