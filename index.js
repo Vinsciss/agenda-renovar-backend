@@ -23,6 +23,43 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Configuração padrão Android para garantir entrega imediata mesmo em Doze/tela bloqueada
+const ANDROID_HIGH_PRIORITY = {
+  priority: 'high',
+  notification: {
+    channelId: 'agenda_renovar_channel',
+    sound: 'default',
+    priority: 'high',
+    defaultSound: true,
+    defaultVibrateTimings: true
+  }
+};
+
+// Extrai tokens suportando tanto o formato novo (array fcmTokens) quanto legado (string fcmToken)
+function obterTokensDoUsuario(userData) {
+  if (!userData) return [];
+  const lista = [];
+  if (Array.isArray(userData.fcmTokens)) {
+    lista.push(...userData.fcmTokens.filter(Boolean));
+  }
+  if (typeof userData.fcmToken === 'string' && userData.fcmToken.trim()) {
+    lista.push(userData.fcmToken.trim());
+  }
+  return [...new Set(lista)];
+}
+
+// Garante que todos os valores de 'data' sejam strings (exigência do FCM)
+function sanitizarDadosFCM(dados) {
+  const out = {};
+  if (!dados || typeof dados !== 'object') return out;
+  for (const [k, v] of Object.entries(dados)) {
+    if (v !== null && v !== undefined) {
+      out[k] = typeof v === 'object' ? JSON.stringify(v) : String(v);
+    }
+  }
+  return out;
+}
+
 app.post('/enviar-notificacao', async (req, res) => {
   const { tokens, titulo, corpo, dados } = req.body;
   
@@ -30,11 +67,14 @@ app.post('/enviar-notificacao', async (req, res) => {
     return res.status(400).json({ erro: "Nenhum destino/token fornecido" });
   }
 
+  const dadosLimpos = sanitizarDadosFCM(dados);
+
   try {
     if (tokens === 'igreja_geral' || (Array.isArray(tokens) && tokens[0] === 'igreja_geral')) {
       const mensagemTopico = {
         notification: { title: titulo, body: corpo },
-        data: dados || {},
+        data: dadosLimpos,
+        android: ANDROID_HIGH_PRIORITY,
         topic: 'igreja_geral'
       };
       const resposta = await admin.messaging().send(mensagemTopico);
@@ -42,13 +82,18 @@ app.post('/enviar-notificacao', async (req, res) => {
       return res.status(200).json({ sucesso: true, detalhes: resposta, tipo: 'topico' });
     } 
     else {
+      const tokensUnicos = [...new Set((Array.isArray(tokens) ? tokens : [tokens]).filter(Boolean))];
+      if (tokensUnicos.length === 0) {
+        return res.status(400).json({ erro: "Nenhum token válido fornecido" });
+      }
       const mensagemMulticast = {
         notification: { title: titulo, body: corpo },
-        data: dados || {},
-        tokens: Array.isArray(tokens) ? tokens : [tokens]
+        data: dadosLimpos,
+        android: ANDROID_HIGH_PRIORITY,
+        tokens: tokensUnicos
       };
       const resposta = await admin.messaging().sendEachForMulticast(mensagemMulticast);
-      console.log('✅ ' + resposta.successCount + ' notificações diretas enviadas.');
+      console.log(`✅ ${resposta.successCount} notificações diretas enviadas (${resposta.failureCount} falhas).`);
       return res.status(200).json({ sucesso: true, detalhes: resposta, tipo: 'direta' });
     }
   } catch (erro) {
@@ -57,7 +102,10 @@ app.post('/enviar-notificacao', async (req, res) => {
   }
 });
 
-// Rota de teste para ver se o servidor está online
+// Rota leve de health check (útil para manter servidor acordado no Render)
+app.get('/health', (req, res) => {
+  res.status(200).json({ ok: true, timestamp: Date.now() });
+});
 
 
 // ==========================================
@@ -121,17 +169,22 @@ app.get('/cron/lembretes-escalas', async (req, res) => {
 ⏰ Horário: ${info.hora || '--:--'}`;
 
        const snapUser = await usuariosRef.where('nome', '==', info.usuario).get();
-       let fcmToken = null;
+       let userTokens = [];
        if (!snapUser.empty) {
-           fcmToken = snapUser.docs[0].data().fcmToken;
+           userTokens = obterTokensDoUsuario(snapUser.docs[0].data());
        } else {
            const snapApelido = await usuariosRef.where('apelido', '==', info.usuario).get();
-           if (!snapApelido.empty) fcmToken = snapApelido.docs[0].data().fcmToken;
+           if (!snapApelido.empty) userTokens = obterTokensDoUsuario(snapApelido.docs[0].data());
        }
 
-       if (fcmToken) {
-           const mensagem = { notification: { title: titulo, body: corpo }, token: fcmToken };
-           promises.push(admin.messaging().send(mensagem).catch(e => console.error("Erro push:", e)));
+       if (userTokens.length > 0) {
+           const mensagem = {
+             notification: { title: titulo, body: corpo },
+             android: ANDROID_HIGH_PRIORITY,
+             data: { tipo: 'escala_criada' },
+             tokens: userTokens
+           };
+           promises.push(admin.messaging().sendEachForMulticast(mensagem).catch(e => console.error("Erro push:", e)));
        }
     }
 
@@ -152,7 +205,7 @@ app.get('/cron/lembretes-trocas', async (req, res) => {
 
     const adminTokens = [];
     const snapAdmins = await usuariosRef.where('admin', '==', true).get();
-    snapAdmins.docs.forEach(d => { if (d.data().fcmToken) adminTokens.push(d.data().fcmToken); });
+    snapAdmins.docs.forEach(d => { adminTokens.push(...obterTokensDoUsuario(d.data())); });
 
     snapshot.forEach(doc => {
       const t = doc.data();
@@ -166,16 +219,21 @@ app.get('/cron/lembretes-trocas', async (req, res) => {
          let tokensTarget = [];
          if (destino && destino !== "Admin" && destino !== "admin") {
              const snapTarget = await usuariosRef.where('nome', '==', destino).get();
-             if (!snapTarget.empty && snapTarget.docs[0].data().fcmToken) tokensTarget.push(snapTarget.docs[0].data().fcmToken);
+             if (!snapTarget.empty) tokensTarget.push(...obterTokensDoUsuario(snapTarget.docs[0].data()));
              else {
                  const snapApelido = await usuariosRef.where('apelido', '==', destino).get();
-                 if (!snapApelido.empty && snapApelido.docs[0].data().fcmToken) tokensTarget.push(snapApelido.docs[0].data().fcmToken);
+                 if (!snapApelido.empty) tokensTarget.push(...obterTokensDoUsuario(snapApelido.docs[0].data()));
              }
          }
          if (tokensTarget.length === 0) tokensTarget = adminTokens;
 
          if (tokensTarget.length > 0) {
-             const mensagem = { notification: { title: titulo, body: corpo }, tokens: [...new Set(tokensTarget)] };
+             const mensagem = {
+               notification: { title: titulo, body: corpo },
+               android: ANDROID_HIGH_PRIORITY,
+               data: { tipo: 'swap-request' },
+               tokens: [...new Set(tokensTarget)]
+             };
              await admin.messaging().sendEachForMulticast(mensagem).catch(e => console.error(e));
          }
       })());
