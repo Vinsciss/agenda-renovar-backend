@@ -16,9 +16,11 @@ if (process.env.FIREBASE_PRIVATE_KEY) {
   serviceAccount = require('./firebase-adminsdk.json');
 }
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+  });
+}
 
 const app = express();
 
@@ -74,6 +76,179 @@ const ANDROID_HIGH_PRIORITY = {
 };
 
 const FCM_MULTICAST_BATCH_SIZE = 500;
+const FIRESTORE_BATCH_LIMIT = 450;
+const ISO_DATE_REGEX = /^(\d{4})-(\d{2})-(\d{2})$/;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+// Espelha hasTesourariaPrivilege de firestore.rules
+function hasTesourariaPrivilege(userData) {
+  return Boolean(
+    userData &&
+    (userData.admin === true ||
+      userData.tesouraria === true ||
+      (typeof userData.role === 'string' && /pastor|tesoureir/i.test(userData.role)))
+  );
+}
+
+// Valida rigorosamente YYYY-MM-DD (incluindo calendário real) e retorna timestamp UTC da meia-noite
+function parseISODateUTC(dateStr) {
+  if (typeof dateStr !== 'string') return null;
+  const match = ISO_DATE_REGEX.exec(dateStr);
+  if (!match) return null;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+  const utcMs = Date.UTC(year, month - 1, day);
+  const check = new Date(utcMs);
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return utcMs;
+}
+
+// Retorna diferença inteira (dataAlvo - hoje) em dias corridos; null se alguma data for malformada
+function diffDiasCalendario(dataAlvoYYYYMMDD, hojeYYYYMMDD) {
+  const alvoMs = parseISODateUTC(dataAlvoYYYYMMDD);
+  const hojeMs = parseISODateUTC(hojeYYYYMMDD);
+  if (alvoMs === null || hojeMs === null) return null;
+  return Math.round((alvoMs - hojeMs) / MS_PER_DAY);
+}
+
+function formatarValorBRL(valor) {
+  const num = Number(valor);
+  const seguro = Number.isFinite(num) ? num : 0;
+  return new Intl.NumberFormat('pt-BR', {
+    style: 'currency',
+    currency: 'BRL'
+  }).format(seguro).replace(/\u00a0/g, ' ');
+}
+
+function formatarDataBR(isoDate) {
+  if (typeof isoDate !== 'string' || !ISO_DATE_REGEX.test(isoDate)) return '';
+  const [y, m, d] = isoDate.split('-');
+  return `${d}/${m}/${y}`;
+}
+
+function truncarTexto(texto, maxLen) {
+  if (typeof texto !== 'string') return '';
+  if (texto.length <= maxLen) return texto;
+  return `${texto.slice(0, Math.max(0, maxLen - 1)).trimEnd()}…`;
+}
+
+// Avalia se um lançamento pendente da Tesouraria deve disparar lembrete hoje e monta o texto
+function avaliarMarcoLembreteTesouraria(tx, hojeStr) {
+  if (!tx || typeof tx !== 'object') return null;
+
+  const reminderDays =
+    typeof tx.reminderDaysBefore === 'number' && Number.isInteger(tx.reminderDaysBefore)
+      ? tx.reminderDaysBefore
+      : 3;
+
+  if (reminderDays < 0) return null;
+
+  const dataReferencia =
+    parseISODateUTC(tx.dueDate) !== null
+      ? tx.dueDate
+      : (parseISODateUTC(tx.date) !== null ? tx.date : null);
+
+  if (!dataReferencia) return null;
+
+  const diasRestantes = diffDiasCalendario(dataReferencia, hojeStr);
+  if (diasRestantes === null) return null;
+
+  let marco = null;
+  let tipo = null;
+
+  if (diasRestantes < 0) {
+    marco = 'atraso';
+    tipo = 'tesouraria-atraso';
+  } else if (diasRestantes === 0) {
+    marco = 'hoje';
+    tipo = 'tesouraria-lembrete';
+  } else if (diasRestantes === 1 && reminderDays > 1) {
+    marco = 'vespera';
+    tipo = 'tesouraria-lembrete';
+  } else if (reminderDays > 0 && diasRestantes === reminderDays) {
+    marco = 'antecipado';
+    tipo = 'tesouraria-lembrete';
+  } else {
+    return null;
+  }
+
+  const isSaida = tx.type === 'saida';
+  const descTx =
+    typeof tx.description === 'string' && tx.description.trim()
+      ? tx.description.trim()
+      : (isSaida ? 'Conta a pagar' : 'Recebimento pendente');
+  const categoriaTx =
+    typeof tx.category === 'string' && tx.category.trim() ? tx.category.trim() : null;
+  const valorBRL = formatarValorBRL(tx.amount);
+  const dataBR = formatarDataBR(dataReferencia);
+
+  let prefixoTitulo = '';
+  let statusFrase = '';
+
+  if (marco === 'atraso') {
+    const diasAtraso = Math.abs(diasRestantes);
+    const sufixoDias = diasAtraso === 1 ? 'há 1 dia' : `há ${diasAtraso} dias`;
+    prefixoTitulo = isSaida
+      ? `🚨 Em atraso (${sufixoDias})`
+      : `🚨 Recebimento em atraso (${sufixoDias})`;
+    statusFrase = `em atraso ${sufixoDias}`;
+  } else if (marco === 'hoje') {
+    prefixoTitulo = isSaida ? '🔔 Vence HOJE' : '🔔 Previsto para HOJE';
+    statusFrase = isSaida ? 'vence hoje' : 'previsto para hoje';
+  } else if (marco === 'vespera' || diasRestantes === 1) {
+    prefixoTitulo = isSaida ? '⏳ Vence amanhã' : '⏳ Previsto para amanhã';
+    statusFrase = isSaida ? 'vence amanhã' : 'previsto para amanhã';
+  } else {
+    prefixoTitulo = isSaida
+      ? `⏰ Vence em ${diasRestantes} dias`
+      : `⏰ Previsto em ${diasRestantes} dias`;
+    statusFrase = isSaida
+      ? `vence em ${diasRestantes} dias`
+      : `previsto em ${diasRestantes} dias`;
+  }
+
+  const labelTipo = isSaida ? 'Pagamento' : 'Recebimento';
+  const labelData = isSaida ? 'Vencimento' : 'Previsão';
+  const trechoCategoria = categoriaTx ? ` • Categoria: ${categoriaTx}` : '';
+
+  const titulo = truncarTexto(`${prefixoTitulo}: ${descTx}`, 200);
+  const descricao = truncarTexto(
+    `${labelTipo} pendente (${statusFrase}): ${descTx} — Valor: ${valorBRL} • ${labelData}: ${dataBR}${trechoCategoria}.`,
+    2000
+  );
+
+  return {
+    marco,
+    tipo,
+    titulo,
+    descricao,
+    dataReferencia,
+    diasRestantes,
+    reminderDays
+  };
+}
+
+// Executa operações de escrita no Firestore em batches de no máximo 450 operações
+async function executarEmLotesFirestore(db, operacoes) {
+  for (let i = 0; i < operacoes.length; i += FIRESTORE_BATCH_LIMIT) {
+    const batch = db.batch();
+    const chunk = operacoes.slice(i, i + FIRESTORE_BATCH_LIMIT);
+    for (const op of chunk) {
+      op(batch);
+    }
+    await batch.commit();
+  }
+}
 
 // Extrai o Bearer Token do header Authorization
 function extrairBearerToken(req) {
@@ -232,6 +407,7 @@ async function carregarMapaUsuarios(db) {
   const porNome = new Map();
   const porApelido = new Map();
   const adminTokensSet = new Set();
+  const tesourariaUsuarios = [];
 
   const adicionarTokens = (mapa, chave, tokens) => {
     if (typeof chave !== 'string') return;
@@ -245,6 +421,19 @@ async function carregarMapaUsuarios(db) {
   snapUsuarios.forEach((doc) => {
     const data = doc.data();
     const tokens = obterTokensDoUsuario(data);
+
+    if (hasTesourariaPrivilege(data)) {
+      const nomeBruto =
+        (typeof data.nome === 'string' && data.nome.trim()) ||
+        (typeof data.apelido === 'string' && data.apelido.trim()) ||
+        'Tesouraria';
+      tesourariaUsuarios.push({
+        uid: doc.id,
+        nome: nomeBruto.trim(),
+        tokens
+      });
+    }
+
     if (tokens.length === 0) return;
 
     adicionarTokens(porNome, data.nome, tokens);
@@ -267,7 +456,8 @@ async function carregarMapaUsuarios(db) {
 
   return {
     buscarTokens,
-    adminTokens: [...adminTokensSet]
+    adminTokens: [...adminTokensSet],
+    tesourariaUsuarios
   };
 }
 
@@ -544,11 +734,224 @@ app.get('/cron/lembretes-trocas', verificarAutorizacaoCron, async (req, res) => 
   }
 });
 
+app.get('/cron/lembretes-tesouraria', verificarAutorizacaoCron, async (req, res) => {
+  const db = admin.firestore();
+  const hojeStr = getBrazilDateOffset(0);
+  const jobName = 'lembretes-tesouraria';
+  let runRef = null;
+
+  try {
+    if (req.query.force === 'true' && !req.isAdmin) {
+      return res.status(403).json({ erro: 'Apenas administradores autenticados podem usar force=true.' });
+    }
+    const forceRun = req.query.force === 'true' && req.isAdmin === true;
+
+    const lock = await adquirirExecucaoDiariaCron(db, jobName, hojeStr, forceRun);
+    if (!lock.adquirido) {
+      return res.status(200).json({
+        sucesso: true,
+        ignorado: true,
+        motivo: `Cron ${jobName} já executado hoje (${hojeStr}).`,
+        runId: lock.runId
+      });
+    }
+    runRef = lock.runRef;
+
+    const [snapTx, mapaUsuarios, snapNotifsTesouraria] = await Promise.all([
+      db.collection('tesouraria_transacoes').where('status', '==', 'pendente').get(),
+      carregarMapaUsuarios(db),
+      db.collection('notificacoes').where('tipo', 'in', ['tesouraria-lembrete', 'tesouraria-atraso']).get()
+    ]);
+
+    const pendingIds = new Set(snapTx.docs.map((d) => d.id));
+    const elegiveis = [];
+
+    snapTx.forEach((doc) => {
+      const tx = doc.data();
+      const avaliacao = avaliarMarcoLembreteTesouraria(tx, hojeStr);
+      if (avaliacao) {
+        const logId = `${doc.id}_${avaliacao.marco}_${hojeStr}`;
+        elegiveis.push({
+          doc,
+          tx,
+          avaliacao,
+          logId,
+          logRef: db.collection('tesouraria_lembretes_log').doc(logId)
+        });
+      }
+    });
+
+    let dispararLista = elegiveis;
+    if (!forceRun && elegiveis.length > 0) {
+      const existentes = new Set();
+      for (let i = 0; i < elegiveis.length; i += FIRESTORE_BATCH_LIMIT) {
+        const slice = elegiveis.slice(i, i + FIRESTORE_BATCH_LIMIT);
+        const snaps = await db.getAll(...slice.map((item) => item.logRef));
+        snaps.forEach((s) => {
+          if (s.exists) existentes.add(s.id);
+        });
+      }
+      dispararLista = elegiveis.filter((item) => !existentes.has(item.logId));
+    }
+
+    const opsEscrita = [];
+    let notificacoesCriadas = 0;
+    const agoraISO = new Date().toISOString();
+    const agoraTs = Date.now();
+
+    for (const item of dispararLista) {
+      const { doc, tx, avaliacao, logRef } = item;
+
+      opsEscrita.push((batch) => {
+        batch.set(logRef, {
+          txId: doc.id,
+          marco: avaliacao.marco,
+          data: hojeStr,
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      });
+
+      const rota = `/admin/tesouraria?filtro=pendentes&tx=${doc.id}`;
+      for (const u of mapaUsuarios.tesourariaUsuarios) {
+        const notifRef = db.collection('notificacoes').doc();
+        opsEscrita.push((batch) => {
+          batch.set(notifRef, {
+            uid: u.uid,
+            usuario: truncarTexto(u.nome, 150),
+            titulo: avaliacao.titulo,
+            descricao: avaliacao.descricao,
+            tipo: avaliacao.tipo,
+            criada_em: agoraISO,
+            lida: false,
+            resolvida: false,
+            meta: {
+              txId: doc.id,
+              txType: tx.type === 'saida' ? 'saida' : 'entrada',
+              amount: Number(tx.amount) || 0,
+              dataReferencia: avaliacao.dataReferencia,
+              diasRestantes: avaliacao.diasRestantes,
+              marco: avaliacao.marco,
+              rota,
+              timestamp: agoraTs
+            }
+          });
+        });
+        notificacoesCriadas += 1;
+      }
+    }
+
+    if (opsEscrita.length > 0) {
+      await executarEmLotesFirestore(db, opsEscrita);
+    }
+
+    // Push FCM para usuários com privilégio da Tesouraria
+    const tokensTesouraria = [
+      ...new Set(mapaUsuarios.tesourariaUsuarios.flatMap((u) => u.tokens || []).filter(Boolean))
+    ];
+    const disparados = dispararLista.length;
+    let pushesEnviados = 0;
+
+    if (disparados > 0 && tokensTesouraria.length > 0) {
+      if (disparados <= 3) {
+        const pushPromises = dispararLista.map(({ doc, avaliacao }) =>
+          enviarMulticastEmLotes(tokensTesouraria, {
+            notification: { title: avaliacao.titulo, body: avaliacao.descricao },
+            android: ANDROID_HIGH_PRIORITY,
+            data: sanitizarDadosFCM({
+              tipo: avaliacao.tipo,
+              txId: doc.id,
+              rota: `/admin/tesouraria?filtro=pendentes&tx=${doc.id}`
+            })
+          }).catch((e) => {
+            console.error('Erro push tesouraria:', e);
+            return { successCount: 0 };
+          })
+        );
+        const resultadosPush = await Promise.all(pushPromises);
+        pushesEnviados = resultadosPush.reduce((acc, r) => acc + (r?.successCount || 0), 0);
+      } else {
+        const qtdAtrasos = dispararLista.filter((item) => item.avaliacao.marco === 'atraso').length;
+        const temAtraso = qtdAtrasos > 0;
+        const tipoResumo = temAtraso ? 'tesouraria-atraso' : 'tesouraria-lembrete';
+        const tituloResumo = temAtraso
+          ? `🚨 Tesouraria: ${disparados} pendências (${qtdAtrasos} em atraso)`
+          : `🔔 Tesouraria: ${disparados} lançamentos próximos`;
+        const valorTotal = dispararLista.reduce((acc, item) => acc + (Number(item.tx.amount) || 0), 0);
+        const corpoResumo = `Há ${disparados} lançamentos pendentes exigindo atenção (total: ${formatarValorBRL(valorTotal)}). Toque para abrir a Tesouraria.`;
+
+        const resultadoResumo = await enviarMulticastEmLotes(tokensTesouraria, {
+          notification: { title: tituloResumo, body: corpoResumo },
+          android: ANDROID_HIGH_PRIORITY,
+          data: sanitizarDadosFCM({
+            tipo: tipoResumo,
+            rota: '/admin/tesouraria?filtro=pendentes'
+          })
+        }).catch((e) => {
+          console.error('Erro push resumo tesouraria:', e);
+          return { successCount: 0 };
+        });
+        pushesEnviados = resultadoResumo?.successCount || 0;
+      }
+    }
+
+    // Limpeza automática de notificações antigas cujas transações já não estão pendentes
+    const opsLimpeza = [];
+    snapNotifsTesouraria.forEach((nDoc) => {
+      const data = nDoc.data();
+      if (!data.resolvida && data.meta?.txId && !pendingIds.has(data.meta.txId)) {
+        opsLimpeza.push((batch) => {
+          batch.update(nDoc.ref, { lida: true, resolvida: true });
+        });
+      }
+    });
+
+    if (opsLimpeza.length > 0) {
+      await executarEmLotesFirestore(db, opsLimpeza);
+    }
+
+    const resumo = {
+      pendentes: snapTx.size,
+      disparados,
+      notificacoesCriadas,
+      pushesEnviados,
+      limpas: opsLimpeza.length
+    };
+
+    await runRef.set({
+      status: 'completed',
+      ...resumo,
+      completedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    return res.status(200).json({ sucesso: true, ...resumo });
+  } catch (err) {
+    if (runRef) {
+      await runRef.set({
+        status: 'failed',
+        erro: err.message,
+        failedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true }).catch(() => {});
+    }
+    return res.status(500).json({ erro: err.message });
+  }
+});
+
 app.get('/', (req, res) => {
   res.send('Servidor de Notificações Ativo! 🚀');
 });
 
-const PORTA = process.env.PORT || 3000;
-app.listen(PORTA, () => {
-  console.log('🚀 Servidor backend rodando na porta ' + PORTA);
-});
+if (require.main === module) {
+  const PORTA = process.env.PORT || 3000;
+  app.listen(PORTA, () => {
+    console.log('🚀 Servidor backend rodando na porta ' + PORTA);
+  });
+}
+
+module.exports = {
+  app,
+  hasTesourariaPrivilege,
+  diffDiasCalendario,
+  avaliarMarcoLembreteTesouraria,
+  formatarValorBRL,
+  formatarDataBR
+};
