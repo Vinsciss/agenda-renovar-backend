@@ -24,6 +24,15 @@ const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_HHMM_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const PREFIXOS_CARGO_REGEX = /^(pr|pra|diac|miss|tes|sec)\s+/i;
 
+const GOOGLE_EVENT_COLORS = {
+  ESCALA_MINHA: '10',       // Verde (Basil)
+  ESCALA_GERAL: '9',        // Azul (Blueberry)
+  TROCA_PENDENTE: '6',      // Laranja (Tangerine)
+  AVISO: '3',               // Roxo (Grape)
+  TESOURARIA_PAGAR: '11',   // Vermelho (Tomato) — saídas pendentes e atrasados
+  TESOURARIA_RECEBER: '5'   // Amarelo (Banana) — entradas pendentes no prazo
+};
+
 function normalizarTexto(str) {
   if (typeof str !== 'string') return '';
   return str
@@ -284,8 +293,8 @@ function formatarMoedaBRL(valor) {
     .replace(/\u00a0/g, ' ');
 }
 
-function criarPayloadEvento({ id, kind, summary, description, start, end, remindersOverrides }) {
-  const baseForHash = JSON.stringify({ summary, description, start, end, kind });
+function criarPayloadEvento({ id, kind, summary, description, start, end, remindersOverrides, colorId }) {
+  const baseForHash = JSON.stringify({ summary, description, start, end, kind, colorId: colorId || null });
   const contentHash = crypto.createHash('sha1').update(baseForHash).digest('hex').slice(0, 20);
 
   return {
@@ -294,6 +303,7 @@ function criarPayloadEvento({ id, kind, summary, description, start, end, remind
     description: String(description || '').slice(0, 4000),
     start,
     end,
+    ...(colorId ? { colorId: String(colorId) } : {}),
     reminders: {
       useDefault: false,
       overrides: remindersOverrides || [
@@ -415,7 +425,8 @@ function construirEventosParaUsuario({
           summary,
           description: descPartes.join('\n'),
           start: intervalo.start,
-          end: intervalo.end
+          end: intervalo.end,
+          colorId: estouEscalado ? GOOGLE_EVENT_COLORS.ESCALA_MINHA : GOOGLE_EVENT_COLORS.ESCALA_GERAL
         })
       );
     }
@@ -472,7 +483,8 @@ function construirEventosParaUsuario({
           summary: `⛪ ${g.eventoNome} — Sua tarefa: ${funcoesStr}`,
           description: desc,
           start: intervalo.start,
-          end: intervalo.end
+          end: intervalo.end,
+          colorId: GOOGLE_EVENT_COLORS.ESCALA_MINHA
         })
       );
     }
@@ -518,6 +530,7 @@ function construirEventosParaUsuario({
           description: `${papelDesc}\n\nFunção: ${t.nome || 'Escala'}\nEvento: ${evNome}\n\nSincronizado pelo Agenda Renovar.`,
           start: intervalo.start,
           end: intervalo.end,
+          colorId: GOOGLE_EVENT_COLORS.TROCA_PENDENTE,
           remindersOverrides: [{ method: 'popup', minutes: 12 * 60 }]
         })
       );
@@ -550,6 +563,7 @@ function construirEventosParaUsuario({
           description: desc,
           start: intervalo.start,
           end: intervalo.end,
+          colorId: GOOGLE_EVENT_COLORS.AVISO,
           remindersOverrides: [{ method: 'popup', minutes: 24 * 60 }]
         })
       );
@@ -617,6 +631,9 @@ function construirEventosParaUsuario({
           description: desc,
           start: intervalo.start,
           end: intervalo.end,
+          colorId: (isSaida || atrasado)
+            ? GOOGLE_EVENT_COLORS.TESOURARIA_PAGAR
+            : GOOGLE_EVENT_COLORS.TESOURARIA_RECEBER,
           remindersOverrides
         })
       );
@@ -1468,5 +1485,6 @@ module.exports = {
   resolverNomeEscalado,
   gerarEventIdGoogle,
   construirEventosParaUsuario,
-  sanitizeReturnTo
+  sanitizeReturnTo,
+  GOOGLE_EVENT_COLORS
 };
