@@ -121,6 +121,43 @@ function usuarioBateComNome(identificadores, candidato) {
   return Boolean(semPrefixo && identificadores.has(semPrefixo));
 }
 
+function usuarioEstaEscaladoNaTarefa(t, identificadores, userId) {
+  if (!t || typeof t !== 'object') return false;
+  if (userId && Array.isArray(t.usuariosUids) && t.usuariosUids.includes(userId)) {
+    return true;
+  }
+  if (Array.isArray(t.usuarios) && t.usuarios.some((u) => usuarioBateComNome(identificadores, u))) {
+    return true;
+  }
+  return false;
+}
+
+function getEndOfWeekISO(isoDate) {
+  if (!ISO_DATE_REGEX.test(isoDate)) return isoDate;
+  const [y, m, d] = isoDate.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  const day = dt.getUTCDay(); // 0=Dom..6=Sab
+  const diff = day === 0 ? 0 : 7 - day;
+  dt.setUTCDate(dt.getUTCDate() + diff);
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getUTCDate()).padStart(2, '0');
+  return `${yy}-${mm}-${dd}`;
+}
+
+function tarefaEstaAtiva(t, minDateStr, maxDateStr) {
+  if (!t || typeof t !== 'object') return false;
+  if (t.prioridade === 'evento' || t.prioridade === 'importante') return false;
+  if (typeof t.data !== 'string' || !ISO_DATE_REGEX.test(t.data)) return false;
+  if (maxDateStr && t.data > maxDateStr) return false;
+  if (!minDateStr) return true;
+  if (t.data >= minDateStr) return true;
+  if (t.nome === 'Limpar a Igreja') {
+    return getEndOfWeekISO(t.data) >= minDateStr;
+  }
+  return false;
+}
+
 function gerarEventIdGoogle(chave) {
   // Google Calendar API exige [a-v0-9] minúsculo entre 5 e 1024 caracteres; hex ([a-f0-9]) é subconjunto válido.
   const hash = crypto.createHash('sha256').update(String(chave)).digest('hex');
@@ -214,6 +251,7 @@ function criarPayloadEvento({ id, kind, summary, description, start, end, remind
  */
 function construirEventosParaUsuario({
   userData,
+  userId = null,
   preferences,
   eventos = [],
   tarefas = [],
@@ -231,64 +269,72 @@ function construirEventosParaUsuario({
   const incluirAvisos =
     incluirTudoAdmin || (caps.canSyncAvisos && preferences?.syncAvisos === true);
 
+  const resolvedUserId = userId || userData?.id || userData?.uid || null;
   const identificadores = gerarIdentificadoresUsuario(userData);
+  const dataMinimaEscala = minDateStr || hojeStr || null;
   const dentroJanela = (iso) =>
     typeof iso === 'string' &&
     ISO_DATE_REGEX.test(iso) &&
-    (!minDateStr || iso >= minDateStr) &&
+    (!dataMinimaEscala || iso >= dataMinimaEscala) &&
     (!maxDateStr || iso <= maxDateStr);
+
+  const eventosById = new Map();
+  for (const ev of eventos || []) {
+    if (ev?.id) eventosById.set(ev.id, ev);
+  }
 
   const mapaEventos = new Map();
 
   // 1. ESCALAS / TAREFAS
+  // Nota: Igual ao AdminDashboard e UserDashboard, eventos são construídos apenas a partir de tarefas ativas
+  // (docs órfãos na coleção `eventos` sem nenhuma tarefa vinculada nunca são sincronizados).
   if (incluirTudoAdmin) {
-    // Modo Completo (Admin): todos os eventos e todas as tarefas da igreja com lista completa de escalados
+    // Modo Completo (Admin): todos os eventos com tarefas ativas + lista de escalados + destaque se o Admin estiver escalado
     const grupos = new Map();
 
-    for (const ev of eventos) {
-      const dataEv = ev.data;
-      if (!dentroJanela(dataEv)) continue;
-      const chave = ev.id || `${ev.nome || 'Evento'}_${dataEv}_${ev.hora || ''}`;
-      if (!grupos.has(chave)) {
-        grupos.set(chave, {
-          key: chave,
-          eventoNome: ev.nome || 'Culto / Evento',
-          data: dataEv,
-          hora: ev.hora || '',
-          local: ev.local || '',
-          linhasTarefas: []
-        });
-      }
-    }
-
     for (const t of tarefas) {
-      if (!dentroJanela(t.data)) continue;
-      const chave = t.eventoId || `${t.eventoNome || 'Evento'}_${t.data}_${t.hora || ''}`;
+      if (!tarefaEstaAtiva(t, dataMinimaEscala, maxDateStr)) continue;
+      const evReal = t.eventoId ? eventosById.get(t.eventoId) : null;
+      const chave = t.eventoId || `legado_${t.data}_${t.eventoNome || t.nome || t.id}`;
       if (!grupos.has(chave)) {
         grupos.set(chave, {
           key: chave,
-          eventoNome: t.eventoNome || 'Culto / Evento',
-          data: t.data,
-          hora: t.hora || '',
-          local: '',
-          linhasTarefas: []
+          eventoNome: evReal?.nome || t.eventoNome || t.nome || 'Culto / Evento',
+          data: evReal?.data || t.data,
+          hora: evReal?.hora || t.hora || t.eventoHora || '',
+          local: evReal?.local || '',
+          linhasTarefas: [],
+          minhasFuncoes: []
         });
       }
       const g = grupos.get(chave);
-      if (!g.hora && t.hora) g.hora = t.hora;
+      if (!g.hora) g.hora = evReal?.hora || t.hora || t.eventoHora || '';
+      const nomeFuncao = t.nome || 'Função';
       const escalados = Array.isArray(t.usuarios) && t.usuarios.length > 0 ? t.usuarios.join(', ') : 'Sem escalados';
-      g.linhasTarefas.push(`• ${t.nome || 'Função'}: ${escalados}`);
+      g.linhasTarefas.push(`• ${nomeFuncao}: ${escalados}`);
+
+      if (usuarioEstaEscaladoNaTarefa(t, identificadores, resolvedUserId)) {
+        if (!g.minhasFuncoes.includes(nomeFuncao)) {
+          g.minhasFuncoes.push(nomeFuncao);
+        }
+      }
     }
 
     for (const g of grupos.values()) {
       const intervalo = montarIntervaloEvento(g.data, g.hora, false, 120);
       if (!intervalo) continue;
       const id = gerarEventIdGoogle(`admin_evento_${g.key}`);
+      const estouEscalado = g.minhasFuncoes.length > 0;
+      const summary = estouEscalado
+        ? `⛪ ${g.eventoNome} — Sua tarefa: ${g.minhasFuncoes.join(', ')}`
+        : `⛪ ${g.eventoNome} (Escala Geral)`;
+
       const descPartes = [
+        estouEscalado ? `⭐ SUA TAREFA: ${g.minhasFuncoes.join(', ')}` : null,
         `Evento: ${g.eventoNome}`,
         g.hora ? `Horário: ${g.hora}` : null,
         g.local ? `Local: ${g.local}` : null,
-        g.linhasTarefas.length > 0 ? `\nEscalados:\n${g.linhasTarefas.join('\n')}` : '\nSem tarefas cadastradas ainda.',
+        g.linhasTarefas.length > 0 ? `\nEscalados:\n${g.linhasTarefas.join('\n')}` : null,
         '\nSincronizado automaticamente pelo Agenda Renovar (Modo Completo).'
       ].filter(Boolean);
 
@@ -296,8 +342,8 @@ function construirEventosParaUsuario({
         id,
         criarPayloadEvento({
           id,
-          kind: 'escala-geral',
-          summary: `⛪ ${g.eventoNome}`,
+          kind: estouEscalado ? 'escala-admin-escalado' : 'escala-geral',
+          summary,
           description: descPartes.join('\n'),
           start: intervalo.start,
           end: intervalo.end
@@ -309,18 +355,22 @@ function construirEventosParaUsuario({
     const gruposPessoais = new Map();
 
     for (const t of tarefas) {
-      if (!dentroJanela(t.data)) continue;
-      if (!Array.isArray(t.usuarios)) continue;
-      const estaEscalado = t.usuarios.some((u) => usuarioBateComNome(identificadores, u));
-      if (!estaEscalado) continue;
+      if (!tarefaEstaAtiva(t, dataMinimaEscala, maxDateStr)) continue;
+      if (!usuarioEstaEscaladoNaTarefa(t, identificadores, resolvedUserId)) continue;
 
-      const chave = `${t.eventoId || t.eventoNome || 'Evento'}_${t.data}_${t.hora || ''}`;
+      const evReal = t.eventoId ? eventosById.get(t.eventoId) : null;
+      const evNome = evReal?.nome || t.eventoNome || t.nome || 'Culto / Evento';
+      const evData = evReal?.data || t.data;
+      const evHora = t.hora || t.eventoHora || evReal?.hora || '';
+      const chave = `${t.eventoId || evNome}_${evData}_${evHora}`;
+
       if (!gruposPessoais.has(chave)) {
         gruposPessoais.set(chave, {
           key: chave,
-          eventoNome: t.eventoNome || 'Culto / Evento',
-          data: t.data,
-          hora: t.hora || '',
+          eventoNome: evNome,
+          data: evData,
+          hora: evHora,
+          local: evReal?.local || '',
           funcoes: []
         });
       }
@@ -336,8 +386,10 @@ function construirEventosParaUsuario({
       const id = gerarEventIdGoogle(`minha_escala_${g.key}`);
       const funcoesStr = g.funcoes.join(', ') || 'Escala';
       const desc = [
-        `Suas funções: ${funcoesStr}`,
+        `⭐ Sua tarefa: ${funcoesStr}`,
+        `Evento: ${g.eventoNome}`,
         g.hora ? `Horário: ${g.hora}` : null,
+        g.local ? `Local: ${g.local}` : null,
         '\nSincronizado automaticamente pelo Agenda Renovar.'
       ]
         .filter(Boolean)
@@ -348,7 +400,7 @@ function construirEventosParaUsuario({
         criarPayloadEvento({
           id,
           kind: 'escala-pessoal',
-          summary: `⛪ ${g.eventoNome} — ${funcoesStr}`,
+          summary: `⛪ ${g.eventoNome} — Sua tarefa: ${funcoesStr}`,
           description: desc,
           start: intervalo.start,
           end: intervalo.end
@@ -360,8 +412,11 @@ function construirEventosParaUsuario({
   // 2. PEDIDOS DE TROCA PENDENTES
   for (const t of tarefas) {
     if (t.status !== 'Troca Pendente') continue;
-    if (!dentroJanela(t.data)) continue;
+    if (!tarefaEstaAtiva(t, dataMinimaEscala, maxDateStr)) continue;
     const solicitantes = Array.isArray(t.solicitantes) ? t.solicitantes : [];
+    const evReal = t.eventoId ? eventosById.get(t.eventoId) : null;
+    const evNome = evReal?.nome || t.eventoNome || 'Evento';
+    const evHora = t.hora || t.eventoHora || evReal?.hora || '';
 
     for (const s of solicitantes) {
       const solicitanteNome = s?.nome || 'Membro';
@@ -373,7 +428,7 @@ function construirEventosParaUsuario({
       const deveIncluirTroca = incluirTudoAdmin || pertenceAoUsuario;
       if (!deveIncluirTroca) continue;
 
-      const intervalo = montarIntervaloEvento(t.data, t.hora, false, 60);
+      const intervalo = montarIntervaloEvento(t.data, evHora, false, 60);
       if (!intervalo) continue;
       const id = gerarEventIdGoogle(`troca_${t.id || t.nome}_${s?.idTroca || solicitanteNome}_${destinoNome}`);
       const ehDestino = usuarioBateComNome(identificadores, destinoNome);
@@ -386,8 +441,8 @@ function construirEventosParaUsuario({
         criarPayloadEvento({
           id,
           kind: 'troca-pendente',
-          summary: `🔄 [Troca Pendente] ${t.nome || 'Escala'} — ${t.eventoNome || 'Evento'}`,
-          description: `${papelDesc}\n\nFunção: ${t.nome || 'Escala'}\nEvento: ${t.eventoNome || 'Evento'}\n\nSincronizado pelo Agenda Renovar.`,
+          summary: `🔄 [Troca Pendente] ${t.nome || 'Escala'} — ${evNome}`,
+          description: `${papelDesc}\n\nFunção: ${t.nome || 'Escala'}\nEvento: ${evNome}\n\nSincronizado pelo Agenda Renovar.`,
           start: intervalo.start,
           end: intervalo.end,
           remindersOverrides: [{ method: 'popup', minutes: 12 * 60 }]
@@ -664,9 +719,9 @@ async function listarEventosGerenciados(accessToken, calendarId) {
   return items;
 }
 
-async function carregarSnapshotAgenda(db, { precisarEventos, precisarAvisos, precisarTesouraria }) {
-  const queries = [db.collection('tarefas').get()];
-  queries.push(precisarEventos ? db.collection('eventos').get() : Promise.resolve(null));
+async function carregarSnapshotAgenda(db, { precisarAvisos, precisarTesouraria }) {
+  // `eventos` é sempre carregado porque tarefas de escala herdam nome/horário do documento pai em `eventos`.
+  const queries = [db.collection('tarefas').get(), db.collection('eventos').get()];
   queries.push(precisarAvisos ? db.collection('avisos').get() : Promise.resolve(null));
   queries.push(
     precisarTesouraria
@@ -716,17 +771,17 @@ function registerGoogleCalendarRoutes({
       const snapshot =
         sharedSnapshot ||
         (await carregarSnapshotAgenda(db, {
-          precisarEventos: incluirTudoAdmin,
           precisarAvisos: incluirAvisos,
           precisarTesouraria: incluirTesouraria
         }));
 
       const hojeStr = getBrazilDateOffset(0);
-      const minDateStr = getBrazilDateOffset(-7);
+      const minDateStr = hojeStr;
       const maxDateStr = getBrazilDateOffset(120);
 
       const desejados = construirEventosParaUsuario({
         userData,
+        userId: userDocId,
         preferences: { mode, syncTesouraria: incluirTesouraria, syncAvisos: incluirAvisos },
         ...snapshot,
         hojeStr,
