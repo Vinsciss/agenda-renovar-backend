@@ -2,6 +2,7 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
+const { registerGoogleCalendarRoutes } = require('./googleCalendarModule');
 
 // 🔒 Sistema de Segurança: Lê das Variáveis de Ambiente (Nuvem) OU do arquivo local
 let serviceAccount;
@@ -934,6 +935,14 @@ app.get('/cron/lembretes-tesouraria', verificarAutorizacaoCron, async (req, res)
     }
     return res.status(500).json({ erro: err.message });
   }
+});
+
+registerGoogleCalendarRoutes({
+  app,
+  admin,
+  verificarAutenticacao,
+  verificarAutorizacaoCron,
+  getBrazilDateOffset
 });
 
 app.get('/', (req, res) => {
