@@ -299,7 +299,7 @@ function montarAcoesParaUsuario({
     return [
       {
         id: 'tesouraria_mark_paid',
-        label: 'Marcar Pago',
+        label: 'Marcar como Pago',
         kind: 'api',
         actionToken: gerarActionToken({ uid, txId, action: 'tesouraria_mark_paid' }, signingSecret)
       },
