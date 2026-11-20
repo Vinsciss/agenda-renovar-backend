@@ -1285,92 +1285,103 @@ function registerGoogleCalendarRoutes({
     }
   });
 
-  // 6. Gatilho automático quando escalas, trocas, avisos ou tesouraria são alterados no app
-  app.post('/google-calendar/sync-affected', verificarAutenticacao, async (req, res) => {
+  async function sincronizarAfetadosInterno(db, { scope = 'all', affectedNames: rawAffectedNames = [] } = {}) {
     if (!isGoogleOAuthConfigured()) {
-      return res.status(200).json({ sucesso: true, ignorado: true, motivo: 'Google OAuth não configurado.' });
+      return { sucesso: true, ignorado: true, motivo: 'Google OAuth não configurado.' };
     }
 
+    const scopeStr = String(scope || 'all');
+    const affectedNames = Array.isArray(rawAffectedNames)
+      ? rawAffectedNames.map((n) => normalizarTexto(n)).filter(Boolean)
+      : [];
+
+    const snapUsuarios = await db
+      .collection('usuarios')
+      .where('googleCalendar.connected', '==', true)
+      .get();
+
+    const alvos = [];
+    snapUsuarios.forEach((doc) => {
+      const u = doc.data();
+      const gc = u.googleCalendar || {};
+      if (!gc.connected || gc.enabled === false) return;
+
+      const caps = getUserCapabilities(u);
+      const isAdminCompleto = caps.isAdmin && gc.mode === 'completo';
+
+      if (scopeStr === 'tesouraria') {
+        if (isAdminCompleto || (caps.canSyncTesouraria && gc.syncTesouraria)) {
+          alvos.push({ id: doc.id, data: u, ref: doc.ref });
+        }
+        return;
+      }
+      if (scopeStr === 'avisos') {
+        if (isAdminCompleto || (caps.canSyncAvisos && gc.syncAvisos)) {
+          alvos.push({ id: doc.id, data: u, ref: doc.ref });
+        }
+        return;
+      }
+      if (scopeStr === 'escalas' || scopeStr === 'trocas') {
+        if (isAdminCompleto || affectedNames.length === 0) {
+          alvos.push({ id: doc.id, data: u, ref: doc.ref });
+          return;
+        }
+        const idsUsuario = gerarIdentificadoresUsuario(u);
+        if (affectedNames.some((n) => usuarioBateComNome(idsUsuario, n))) {
+          alvos.push({ id: doc.id, data: u, ref: doc.ref });
+        }
+        return;
+      }
+
+      alvos.push({ id: doc.id, data: u, ref: doc.ref });
+    });
+
+    if (alvos.length === 0) {
+      return { sucesso: true, sincronizados: 0, erros: 0 };
+    }
+
+    const sharedSnapshot = await carregarSnapshotAgenda(db, {
+      precisarEventos: alvos.some((a) => getUserCapabilities(a.data).isAdmin && a.data.googleCalendar?.mode === 'completo'),
+      precisarAvisos: alvos.some((a) => {
+        const c = getUserCapabilities(a.data);
+        return (c.isAdmin && a.data.googleCalendar?.mode === 'completo') || (c.canSyncAvisos && a.data.googleCalendar?.syncAvisos);
+      }),
+      precisarTesouraria: alvos.some((a) => {
+        const c = getUserCapabilities(a.data);
+        return (c.isAdmin && a.data.googleCalendar?.mode === 'completo') || (c.canSyncTesouraria && a.data.googleCalendar?.syncTesouraria);
+      })
+    });
+
+    let sincronizados = 0;
+    let erros = 0;
+    const CONCURRENCY = 4;
+
+    for (let i = 0; i < alvos.length; i += CONCURRENCY) {
+      const batch = alvos.slice(i, i + CONCURRENCY);
+      const results = await Promise.allSettled(
+        batch.map((alvo) => sincronizarUsuario(db, alvo.id, alvo.data, alvo.ref, sharedSnapshot))
+      );
+      for (const r of results) {
+        if (r.status === 'fulfilled') sincronizados += 1;
+        else erros += 1;
+      }
+    }
+
+    return { sucesso: true, sincronizados, erros };
+  }
+
+  // 6. Gatilho automático quando escalas, trocas, avisos ou tesouraria são alterados no app
+  app.post('/google-calendar/sync-affected', verificarAutenticacao, async (req, res) => {
     try {
       const db = admin.firestore();
-      const scope = String(req.body?.scope || 'all');
-      const affectedNames = Array.isArray(req.body?.affectedNames)
-        ? req.body.affectedNames.map((n) => normalizarTexto(n)).filter(Boolean)
-        : [];
-
-      const snapUsuarios = await db
-        .collection('usuarios')
-        .where('googleCalendar.connected', '==', true)
-        .get();
-
-      const alvos = [];
-      snapUsuarios.forEach((doc) => {
-        const u = doc.data();
-        const gc = u.googleCalendar || {};
-        if (!gc.connected || gc.enabled === false) return;
-
-        const caps = getUserCapabilities(u);
-        const isAdminCompleto = caps.isAdmin && gc.mode === 'completo';
-
-        if (scope === 'tesouraria') {
-          if (isAdminCompleto || (caps.canSyncTesouraria && gc.syncTesouraria)) {
-            alvos.push({ id: doc.id, data: u, ref: doc.ref });
-          }
-          return;
-        }
-        if (scope === 'avisos') {
-          if (isAdminCompleto || (caps.canSyncAvisos && gc.syncAvisos)) {
-            alvos.push({ id: doc.id, data: u, ref: doc.ref });
-          }
-          return;
-        }
-        if (scope === 'escalas' || scope === 'trocas') {
-          if (isAdminCompleto || affectedNames.length === 0) {
-            alvos.push({ id: doc.id, data: u, ref: doc.ref });
-            return;
-          }
-          const idsUsuario = gerarIdentificadoresUsuario(u);
-          if (affectedNames.some((n) => usuarioBateComNome(idsUsuario, n))) {
-            alvos.push({ id: doc.id, data: u, ref: doc.ref });
-          }
-          return;
-        }
-
-        alvos.push({ id: doc.id, data: u, ref: doc.ref });
+      const result = await sincronizarAfetadosInterno(db, {
+        scope: req.body?.scope || 'all',
+        affectedNames: req.body?.affectedNames || []
       });
-
-      if (alvos.length === 0) {
-        return res.status(200).json({ sucesso: true, sincronizados: 0 });
+      if (result.ignorado) {
+        return res.status(200).json(result);
       }
-
-      const sharedSnapshot = await carregarSnapshotAgenda(db, {
-        precisarEventos: alvos.some((a) => getUserCapabilities(a.data).isAdmin && a.data.googleCalendar?.mode === 'completo'),
-        precisarAvisos: alvos.some((a) => {
-          const c = getUserCapabilities(a.data);
-          return (c.isAdmin && a.data.googleCalendar?.mode === 'completo') || (c.canSyncAvisos && a.data.googleCalendar?.syncAvisos);
-        }),
-        precisarTesouraria: alvos.some((a) => {
-          const c = getUserCapabilities(a.data);
-          return (c.isAdmin && a.data.googleCalendar?.mode === 'completo') || (c.canSyncTesouraria && a.data.googleCalendar?.syncTesouraria);
-        })
-      });
-
-      let sincronizados = 0;
-      let erros = 0;
-      const CONCURRENCY = 4;
-
-      for (let i = 0; i < alvos.length; i += CONCURRENCY) {
-        const batch = alvos.slice(i, i + CONCURRENCY);
-        const results = await Promise.allSettled(
-          batch.map((alvo) => sincronizarUsuario(db, alvo.id, alvo.data, alvo.ref, sharedSnapshot))
-        );
-        for (const r of results) {
-          if (r.status === 'fulfilled') sincronizados += 1;
-          else erros += 1;
-        }
-      }
-
-      return res.status(200).json({ sucesso: true, sincronizados, erros });
+      return res.status(200).json(result);
     } catch (err) {
       console.error('❌ Erro em /google-calendar/sync-affected:', err);
       return res.status(500).json({ erro: 'Erro ao sincronizar agendas afetadas.' });
@@ -1474,6 +1485,13 @@ function registerGoogleCalendarRoutes({
       return res.status(500).json({ erro: err.message });
     }
   });
+
+  return {
+    sincronizarAfetadosInterno: async ({ scope = 'all', affectedNames = [] } = {}) => {
+      const db = admin.firestore();
+      return sincronizarAfetadosInterno(db, { scope, affectedNames });
+    }
+  };
 }
 
 module.exports = {

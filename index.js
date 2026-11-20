@@ -3,6 +3,12 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const { registerGoogleCalendarRoutes } = require('./googleCalendarModule');
+const {
+  obterEstiloNotificacao,
+  resolverSigningSecret,
+  enviarPushInteligente,
+  registerNotificationActionRoutes
+} = require('./notificationActionsModule');
 
 // 🔒 Sistema de Segurança: Lê das Variáveis de Ambiente (Nuvem) OU do arquivo local
 let serviceAccount;
@@ -22,6 +28,8 @@ if (!admin.apps.length) {
     credential: admin.credential.cert(serviceAccount)
   });
 }
+
+const ACTION_SIGNING_SECRET = resolverSigningSecret(null, serviceAccount);
 
 const app = express();
 
@@ -377,12 +385,13 @@ async function enviarMulticastEmLotes(tokens, payload) {
   ];
 
   if (tokensUnicos.length === 0) {
-    return { successCount: 0, failureCount: 0, responses: [], lotes: 0 };
+    return { successCount: 0, failureCount: 0, responses: [], tokenResults: [], lotes: 0 };
   }
 
   let successCount = 0;
   let failureCount = 0;
   const responses = [];
+  const tokenResults = [];
   let lotes = 0;
 
   for (let i = 0; i < tokensUnicos.length; i += FCM_MULTICAST_BATCH_SIZE) {
@@ -395,11 +404,18 @@ async function enviarMulticastEmLotes(tokens, payload) {
     failureCount += resposta.failureCount || 0;
     if (Array.isArray(resposta.responses)) {
       responses.push(...resposta.responses);
+      resposta.responses.forEach((resp, idx) => {
+        tokenResults.push({
+          token: lote[idx],
+          success: Boolean(resp && resp.success),
+          errorCode: resp?.error?.code || null
+        });
+      });
     }
     lotes += 1;
   }
 
-  return { successCount, failureCount, responses, lotes };
+  return { successCount, failureCount, responses, tokenResults, lotes };
 }
 
 // Carrega toda a coleção de usuários uma única vez por execução de cron (evita N+1 queries)
@@ -458,7 +474,8 @@ async function carregarMapaUsuarios(db) {
   return {
     buscarTokens,
     adminTokens: [...adminTokensSet],
-    tesourariaUsuarios
+    tesourariaUsuarios,
+    usuariosSnap: snapUsuarios
   };
 }
 
@@ -510,10 +527,22 @@ app.post('/enviar-notificacao', verificarAutenticacao, async (req, res) => {
 
   try {
     if (tokens === 'igreja_geral' || (Array.isArray(tokens) && tokens[0] === 'igreja_geral')) {
+      const estiloTopico = obterEstiloNotificacao(dadosLimpos.tipo || 'aviso_geral');
       const mensagemTopico = {
         notification: { title: titulo, body: corpo },
-        data: dadosLimpos,
-        android: ANDROID_HIGH_PRIORITY,
+        data: sanitizarDadosFCM({
+          ...dadosLimpos,
+          canal: estiloTopico.channelId,
+          cor: estiloTopico.color
+        }),
+        android: {
+          ...ANDROID_HIGH_PRIORITY,
+          notification: {
+            ...ANDROID_HIGH_PRIORITY.notification,
+            channelId: estiloTopico.channelId,
+            color: estiloTopico.color
+          }
+        },
         topic: 'igreja_geral'
       };
       const resposta = await admin.messaging().send(mensagemTopico);
@@ -526,12 +555,19 @@ app.post('/enviar-notificacao', verificarAutenticacao, async (req, res) => {
       if (tokensUnicos.length === 0) {
         return res.status(400).json({ erro: "Nenhum token válido fornecido" });
       }
-      const resposta = await enviarMulticastEmLotes(tokensUnicos, {
-        notification: { title: titulo, body: corpo },
-        data: dadosLimpos,
-        android: ANDROID_HIGH_PRIORITY
+      const resposta = await enviarPushInteligente({
+        db: admin.firestore(),
+        admin,
+        tokens: tokensUnicos,
+        titulo,
+        corpo,
+        dados: dados || {},
+        hasTesourariaPrivilege,
+        enviarMulticastEmLotes,
+        sanitizarDadosFCM,
+        signingSecret: ACTION_SIGNING_SECRET
       });
-      console.log(`✅ ${resposta.successCount} notificações diretas enviadas (${resposta.failureCount} falhas, ${resposta.lotes} lote(s)).`);
+      console.log(`✅ ${resposta.successCount} notificações diretas enviadas (${resposta.failureCount} falhas, ${resposta.lotes} lote(s), ${resposta.prunedCount} token(s) podado(s)).`);
       return res.status(200).json({ sucesso: true, detalhes: resposta, tipo: 'direta' });
     }
   } catch (erro) {
@@ -622,10 +658,18 @@ app.get('/cron/lembretes-escalas', verificarAutorizacaoCron, async (req, res) =>
 
       if (userTokens.length > 0) {
         promises.push(
-          enviarMulticastEmLotes(userTokens, {
-            notification: { title: titulo, body: corpo },
-            android: ANDROID_HIGH_PRIORITY,
-            data: { tipo: 'escala_criada' }
+          enviarPushInteligente({
+            db,
+            admin,
+            tokens: userTokens,
+            titulo,
+            corpo,
+            dados: { tipo: 'escala_criada' },
+            hasTesourariaPrivilege,
+            enviarMulticastEmLotes,
+            sanitizarDadosFCM,
+            signingSecret: ACTION_SIGNING_SECRET,
+            usuariosSnapCache: mapaUsuarios.usuariosSnap
           }).catch((e) => console.error("Erro push:", e))
         );
       }
@@ -684,8 +728,10 @@ app.get('/cron/lembretes-trocas', verificarAutorizacaoCron, async (req, res) => 
 
     snapshot.forEach((doc) => {
       const t = doc.data();
-      const solicitante = t.solicitantes && t.solicitantes[0] ? t.solicitantes[0].nome : "Um membro";
-      const destino = t.solicitantes && t.solicitantes[0] ? t.solicitantes[0].destino : null;
+      const solicitacao0 = Array.isArray(t.solicitantes) && t.solicitantes[0] ? t.solicitantes[0] : {};
+      const solicitante = solicitacao0.nome || "Um membro";
+      const destino = solicitacao0.destino || null;
+      const idTroca = solicitacao0.idTroca || null;
 
       const dataFormatada = (typeof t.data === 'string' && t.data.includes('-'))
         ? t.data.split('-').reverse().join('/')
@@ -695,19 +741,35 @@ app.get('/cron/lembretes-trocas', verificarAutorizacaoCron, async (req, res) => 
       const corpo = `O pedido de troca de ${solicitante} para a função ${t.nome || 'Escala'} no dia ${dataFormatada} continua aguardando resposta!`;
 
       let tokensTarget = [];
+      let tipoNotif = 'swap-request';
       if (destino && destino !== "Admin" && destino !== "admin") {
         tokensTarget = mapaUsuarios.buscarTokens(destino);
       }
       if (tokensTarget.length === 0) {
         tokensTarget = mapaUsuarios.adminTokens;
+        tipoNotif = 'swap-info-admin';
       }
 
       if (tokensTarget.length > 0) {
         promises.push(
-          enviarMulticastEmLotes(tokensTarget, {
-            notification: { title: titulo, body: corpo },
-            android: ANDROID_HIGH_PRIORITY,
-            data: { tipo: 'swap-request' }
+          enviarPushInteligente({
+            db,
+            admin,
+            tokens: tokensTarget,
+            titulo,
+            corpo,
+            dados: {
+              tipo: tipoNotif,
+              idTroca,
+              tarefaId: doc.id,
+              solicitante,
+              destino
+            },
+            hasTesourariaPrivilege,
+            enviarMulticastEmLotes,
+            sanitizarDadosFCM,
+            signingSecret: ACTION_SIGNING_SECRET,
+            usuariosSnapCache: mapaUsuarios.usuariosSnap
           }).catch((e) => console.error(e))
         );
       }
@@ -855,14 +917,22 @@ app.get('/cron/lembretes-tesouraria', verificarAutorizacaoCron, async (req, res)
     if (disparados > 0 && tokensTesouraria.length > 0) {
       if (disparados <= 3) {
         const pushPromises = dispararLista.map(({ doc, avaliacao }) =>
-          enviarMulticastEmLotes(tokensTesouraria, {
-            notification: { title: avaliacao.titulo, body: avaliacao.descricao },
-            android: ANDROID_HIGH_PRIORITY,
-            data: sanitizarDadosFCM({
+          enviarPushInteligente({
+            db,
+            admin,
+            tokens: tokensTesouraria,
+            titulo: avaliacao.titulo,
+            corpo: avaliacao.descricao,
+            dados: {
               tipo: avaliacao.tipo,
               txId: doc.id,
               rota: `/admin/tesouraria?filtro=pendentes&tx=${doc.id}`
-            })
+            },
+            hasTesourariaPrivilege,
+            enviarMulticastEmLotes,
+            sanitizarDadosFCM,
+            signingSecret: ACTION_SIGNING_SECRET,
+            usuariosSnapCache: mapaUsuarios.usuariosSnap
           }).catch((e) => {
             console.error('Erro push tesouraria:', e);
             return { successCount: 0 };
@@ -880,13 +950,21 @@ app.get('/cron/lembretes-tesouraria', verificarAutorizacaoCron, async (req, res)
         const valorTotal = dispararLista.reduce((acc, item) => acc + (Number(item.tx.amount) || 0), 0);
         const corpoResumo = `Há ${disparados} lançamentos pendentes exigindo atenção (total: ${formatarValorBRL(valorTotal)}). Toque para abrir a Tesouraria.`;
 
-        const resultadoResumo = await enviarMulticastEmLotes(tokensTesouraria, {
-          notification: { title: tituloResumo, body: corpoResumo },
-          android: ANDROID_HIGH_PRIORITY,
-          data: sanitizarDadosFCM({
+        const resultadoResumo = await enviarPushInteligente({
+          db,
+          admin,
+          tokens: tokensTesouraria,
+          titulo: tituloResumo,
+          corpo: corpoResumo,
+          dados: {
             tipo: tipoResumo,
             rota: '/admin/tesouraria?filtro=pendentes'
-          })
+          },
+          hasTesourariaPrivilege,
+          enviarMulticastEmLotes,
+          sanitizarDadosFCM,
+          signingSecret: ACTION_SIGNING_SECRET,
+          usuariosSnapCache: mapaUsuarios.usuariosSnap
         }).catch((e) => {
           console.error('Erro push resumo tesouraria:', e);
           return { successCount: 0 };
@@ -937,12 +1015,22 @@ app.get('/cron/lembretes-tesouraria', verificarAutorizacaoCron, async (req, res)
   }
 });
 
-registerGoogleCalendarRoutes({
+const gcalModule = registerGoogleCalendarRoutes({
   app,
   admin,
   verificarAutenticacao,
   verificarAutorizacaoCron,
   getBrazilDateOffset
+});
+
+registerNotificationActionRoutes({
+  app,
+  admin,
+  hasTesourariaPrivilege,
+  enviarMulticastEmLotes,
+  sanitizarDadosFCM,
+  sincronizarGoogleCalendarAfetados: gcalModule?.sincronizarAfetadosInterno,
+  signingSecret: ACTION_SIGNING_SECRET
 });
 
 app.get('/', (req, res) => {
