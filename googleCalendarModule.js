@@ -121,6 +121,72 @@ function usuarioBateComNome(identificadores, candidato) {
   return Boolean(semPrefixo && identificadores.has(semPrefixo));
 }
 
+const ABREVIACOES_ESCALA_PERMITIDAS = {
+  'Diácono(a)': 'Diac.',
+  'Pastor(a)': 'Pr.',
+  'Missionário(a)': 'Miss.'
+};
+
+/**
+ * Formata nome de exibição para escalas:
+ * - Sempre usa apelido (ou primeiro nome se não houver apelido)
+ * - Prefixa abreviação APENAS para Pastor(a), Diácono(a) e Missionário(a).
+ */
+function formatarNomeEscalado(user) {
+  if (!user || typeof user !== 'object') return '';
+  const nome = typeof user.nome === 'string' ? user.nome.trim() : '';
+  const apelido = typeof user.apelido === 'string' ? user.apelido.trim() : '';
+  const cleanRole = typeof user.role === 'string' ? user.role.trim() : '';
+
+  let prefixo = ABREVIACOES_ESCALA_PERMITIDAS[cleanRole] || '';
+  let nomeExibicao = apelido || (nome ? nome.split(/\s+/)[0] : '');
+
+  if (cleanRole === 'Pastor(a)' && nomeExibicao) {
+    prefixo = nomeExibicao.toLowerCase().endsWith('a') ? 'Pra.' : 'Pr.';
+  }
+
+  if (!prefixo) {
+    return nomeExibicao.replace(/^(tes|sec)\.?\s+/i, '').trim();
+  }
+
+  if (!apelido && nome) {
+    const pLower = prefixo.toLowerCase();
+    const pSemPonto = pLower.slice(0, -1);
+    const nLower = nome.toLowerCase();
+    if (nLower.startsWith(pLower) || nLower.startsWith(`${pSemPonto} `)) {
+      const parts = nome.split(/\s+/);
+      nomeExibicao = parts.length >= 2 ? `${parts[0]} ${parts[1]}` : parts[0];
+    }
+  }
+
+  const pLower = prefixo.toLowerCase();
+  const pSemPonto = pLower.slice(0, -1);
+  const currLower = nomeExibicao.toLowerCase();
+  if (currLower.startsWith(pLower) || currLower.startsWith(`${pSemPonto} `)) {
+    return nomeExibicao;
+  }
+
+  return `${prefixo} ${nomeExibicao}`;
+}
+
+function resolverNomeEscalado(rawName, usuarios = []) {
+  const texto = String(rawName || '').trim();
+  if (!texto) return '';
+  for (const u of usuarios || []) {
+    const ids = gerarIdentificadoresUsuario(u);
+    if (usuarioBateComNome(ids, texto)) {
+      const formatado = formatarNomeEscalado(u);
+      if (formatado) return formatado;
+    }
+  }
+  const semTesSec = texto.replace(/^(tes|sec)\.?\s+/i, '').trim();
+  const parts = semTesSec.split(/\s+/);
+  if (/^(pr|pra|diac|miss)\.?$/i.test(parts[0]) && parts.length >= 2) {
+    return `${parts[0]} ${parts[1]}`;
+  }
+  return parts[0] || semTesSec;
+}
+
 function usuarioEstaEscaladoNaTarefa(t, identificadores, userId) {
   if (!t || typeof t !== 'object') return false;
   if (userId && Array.isArray(t.usuariosUids) && t.usuariosUids.includes(userId)) {
@@ -253,6 +319,7 @@ function construirEventosParaUsuario({
   userData,
   userId = null,
   preferences,
+  usuarios = [],
   eventos = [],
   tarefas = [],
   avisos = [],
@@ -310,7 +377,9 @@ function construirEventosParaUsuario({
       const g = grupos.get(chave);
       if (!g.hora) g.hora = evReal?.hora || t.hora || t.eventoHora || '';
       const nomeFuncao = t.nome || 'Função';
-      const escalados = Array.isArray(t.usuarios) && t.usuarios.length > 0 ? t.usuarios.join(', ') : 'Sem escalados';
+      const escalados = Array.isArray(t.usuarios) && t.usuarios.length > 0
+        ? t.usuarios.map((u) => resolverNomeEscalado(u, usuarios)).join(', ')
+        : 'Sem escalados';
       g.linhasTarefas.push(`• ${nomeFuncao}: ${escalados}`);
 
       if (usuarioEstaEscaladoNaTarefa(t, identificadores, resolvedUserId)) {
@@ -432,9 +501,13 @@ function construirEventosParaUsuario({
       if (!intervalo) continue;
       const id = gerarEventIdGoogle(`troca_${t.id || t.nome}_${s?.idTroca || solicitanteNome}_${destinoNome}`);
       const ehDestino = usuarioBateComNome(identificadores, destinoNome);
+      const solDisplay = resolverNomeEscalado(solicitanteNome, usuarios);
+      const destDisplay = /^admin$/i.test(String(destinoNome).trim())
+        ? 'Admin'
+        : resolverNomeEscalado(destinoNome, usuarios);
       const papelDesc = ehDestino
-        ? `${solicitanteNome} solicitou troca com você. Abra o Agenda Renovar para aceitar ou recusar.`
-        : `Pedido de troca de ${solicitanteNome} para ${destinoNome} aguardando resposta.`;
+        ? `${solDisplay} solicitou troca com você. Abra o Agenda Renovar para aceitar ou recusar.`
+        : `Pedido de troca de ${solDisplay} para ${destDisplay} aguardando resposta.`;
 
       mapaEventos.set(
         id,
@@ -720,8 +793,12 @@ async function listarEventosGerenciados(accessToken, calendarId) {
 }
 
 async function carregarSnapshotAgenda(db, { precisarAvisos, precisarTesouraria }) {
-  // `eventos` é sempre carregado porque tarefas de escala herdam nome/horário do documento pai em `eventos`.
-  const queries = [db.collection('tarefas').get(), db.collection('eventos').get()];
+  // `eventos` e `usuarios` são sempre carregados para enriquecer nome/horário e formatar apelido + cargo permitido.
+  const queries = [
+    db.collection('tarefas').get(),
+    db.collection('eventos').get(),
+    db.collection('usuarios').get()
+  ];
   queries.push(precisarAvisos ? db.collection('avisos').get() : Promise.resolve(null));
   queries.push(
     precisarTesouraria
@@ -729,11 +806,12 @@ async function carregarSnapshotAgenda(db, { precisarAvisos, precisarTesouraria }
       : Promise.resolve(null)
   );
 
-  const [snapTarefas, snapEventos, snapAvisos, snapTx] = await Promise.all(queries);
+  const [snapTarefas, snapEventos, snapUsuarios, snapAvisos, snapTx] = await Promise.all(queries);
 
   return {
     tarefas: snapTarefas ? snapTarefas.docs.map((d) => ({ id: d.id, ...d.data() })) : [],
     eventos: snapEventos ? snapEventos.docs.map((d) => ({ id: d.id, ...d.data() })) : [],
+    usuarios: snapUsuarios ? snapUsuarios.docs.map((d) => ({ id: d.id, ...d.data() })) : [],
     avisos: snapAvisos ? snapAvisos.docs.map((d) => ({ id: d.id, ...d.data() })) : [],
     transacoesPendentes: snapTx ? snapTx.docs.map((d) => ({ id: d.id, ...d.data() })) : []
   };
@@ -1386,6 +1464,8 @@ module.exports = {
   getUserCapabilities,
   gerarIdentificadoresUsuario,
   usuarioBateComNome,
+  formatarNomeEscalado,
+  resolverNomeEscalado,
   gerarEventIdGoogle,
   construirEventosParaUsuario,
   sanitizeReturnTo
