@@ -66,8 +66,18 @@ function getDefaultFrontendUrl() {
 function sanitizeReturnTo(rawReturnTo) {
   const fallback = `${getDefaultFrontendUrl()}/configuracoes`;
   if (typeof rawReturnTo !== 'string' || !rawReturnTo.trim()) return fallback;
+  const trimmed = rawReturnTo.trim();
+
+  // Deep-link nativo do app Android/iOS (ex.: agendarenovar://oauth-callback/configuracoes)
+  if (/^agendarenovar:\/\/oauth-callback(\/[a-zA-Z0-9/_-]*)?$/.test(trimmed)) {
+    const pathPart = trimmed.replace(/^agendarenovar:\/\/oauth-callback/, '') || '/configuracoes';
+    if (!pathPart.startsWith('//')) {
+      return `agendarenovar://oauth-callback${pathPart}`;
+    }
+  }
+
   try {
-    const parsed = new URL(rawReturnTo.trim());
+    const parsed = new URL(trimmed);
     if (!ALLOWED_FRONTEND_ORIGINS.has(parsed.origin)) {
       return fallback;
     }
@@ -75,6 +85,70 @@ function sanitizeReturnTo(rawReturnTo) {
   } catch {
     return fallback;
   }
+}
+
+function escapeHtmlAttr(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function enviarRetornoOAuth(res, returnTo, queryString) {
+  const targetUrl = `${returnTo}?${queryString}`;
+  if (!returnTo.startsWith('agendarenovar://')) {
+    return res.redirect(targetUrl);
+  }
+
+  const pathPart = returnTo.replace(/^agendarenovar:\/\/oauth-callback/, '') || '/configuracoes';
+  const intentUrl = `intent://oauth-callback${pathPart}?${queryString}#Intent;scheme=agendarenovar;package=com.renovar.agenda;end`;
+  const isSuccess = queryString.includes('google_calendar=connected');
+  const isCancelled = queryString.includes('google_calendar=cancelled');
+  const titulo = isSuccess
+    ? 'Conta Google vinculada!'
+    : isCancelled
+      ? 'Conexão cancelada'
+      : 'Não foi possível concluir';
+  const subtitulo = isSuccess
+    ? 'Retornando automaticamente para o aplicativo Agenda Renovar...'
+    : 'Toque no botão abaixo para voltar ao aplicativo Agenda Renovar.';
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.status(200).send(`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agenda Renovar</title>
+  <style>
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; }
+    .card { width: 100%; max-width: 380px; background: #1e293b; border: 1px solid #334155; border-radius: 20px; padding: 28px 22px; text-align: center; box-shadow: 0 20px 50px rgba(0,0,0,0.35); }
+    h1 { margin: 0 0 10px; font-size: 20px; font-weight: 800; color: ${isSuccess ? '#34d399' : '#fbbf24'}; }
+    p { margin: 0 0 22px; font-size: 14px; line-height: 1.5; color: #cbd5e1; }
+    a.btn { display: inline-block; width: 100%; box-sizing: border-box; padding: 14px 18px; border-radius: 14px; background: #0d9488; color: #ffffff; text-decoration: none; font-weight: 700; font-size: 15px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>${titulo}</h1>
+    <p>${subtitulo}</p>
+    <a class="btn" id="backBtn" href="${escapeHtmlAttr(intentUrl)}">Voltar para o Agenda Renovar</a>
+  </div>
+  <script>
+    (function () {
+      var deepLink = ${JSON.stringify(targetUrl)};
+      var intentLink = ${JSON.stringify(intentUrl)};
+      window.location.replace(deepLink);
+      setTimeout(function () {
+        if (!document.hidden) {
+          window.location.href = intentLink;
+        }
+      }, 650);
+    })();
+  </script>
+</body>
+</html>`);
 }
 
 function getUserCapabilities(userData) {
@@ -1077,11 +1151,11 @@ function registerGoogleCalendarRoutes({
     const returnTo = sanitizeReturnTo(stateData.returnTo);
 
     if (error) {
-      return res.redirect(`${returnTo}?google_calendar=cancelled`);
+      return enviarRetornoOAuth(res, returnTo, 'google_calendar=cancelled');
     }
 
     if (!code || typeof code !== 'string' || Date.now() > Number(stateData.expiresAt || 0)) {
-      return res.redirect(`${returnTo}?google_calendar=error&reason=expired`);
+      return enviarRetornoOAuth(res, returnTo, 'google_calendar=error&reason=expired');
     }
 
     try {
@@ -1102,7 +1176,7 @@ function registerGoogleCalendarRoutes({
       const tokenJson = await tokenResp.json().catch(() => ({}));
       if (!tokenResp.ok || !tokenJson.access_token) {
         console.error('❌ Erro ao trocar code por token Google:', tokenJson);
-        return res.redirect(`${returnTo}?google_calendar=error&reason=token_exchange`);
+        return enviarRetornoOAuth(res, returnTo, 'google_calendar=error&reason=token_exchange');
       }
 
       const accessToken = tokenJson.access_token;
@@ -1127,7 +1201,7 @@ function registerGoogleCalendarRoutes({
       const [userSnap, prevTokenSnap] = await Promise.all([userRef.get(), tokenRef.get()]);
 
       if (!userSnap.exists) {
-        return res.redirect(`${returnTo}?google_calendar=error&reason=user_not_found`);
+        return enviarRetornoOAuth(res, returnTo, 'google_calendar=error&reason=user_not_found');
       }
 
       const userData = userSnap.data();
@@ -1187,10 +1261,10 @@ function registerGoogleCalendarRoutes({
         console.warn('⚠️ Aviso na sincronização inicial pós-OAuth:', syncErr.message);
       });
 
-      return res.redirect(`${returnTo}?google_calendar=connected`);
+      return enviarRetornoOAuth(res, returnTo, 'google_calendar=connected');
     } catch (err) {
       console.error('❌ Erro no callback OAuth Google:', err);
-      return res.redirect(`${returnTo}?google_calendar=error&reason=internal`);
+      return enviarRetornoOAuth(res, returnTo, 'google_calendar=error&reason=internal');
     }
   });
 
