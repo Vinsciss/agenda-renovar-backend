@@ -1,7 +1,8 @@
 const crypto = require('crypto');
 const {
   gerarIdentificadoresUsuario,
-  usuarioBateComNome
+  usuarioBateComNome,
+  ehUsuarioDoApp
 } = require('./googleCalendarModule');
 
 const DEFAULT_ACTION_TOKEN_TTL_MS = 48 * 60 * 60 * 1000;
@@ -211,7 +212,7 @@ function montarAcoesParaUsuario({
   hasTesourariaPrivilege,
   signingSecret
 }) {
-  if (!uid) return [];
+  if (!uid || !ehUsuarioDoApp(userData)) return [];
   const t = limparStr(tipo);
   const { idTroca, tarefaId, solicitante, destino, txId } = extrairContextoDados(dados);
   const isAdmin = userData?.admin === true;
@@ -408,6 +409,7 @@ async function enviarPushInteligente({
   const usuariosMatch = [];
   const tokenMetaMap = new Map();
   const tokenToUidsOwned = new Set();
+  const blockedNonAppTokens = new Set();
 
   snapUsuarios.forEach((doc) => {
     const data = doc.data() || {};
@@ -422,6 +424,11 @@ async function enviarPushInteligente({
 
     const uniqueUserTokens = [...new Set(list)];
     if (uniqueUserTokens.length === 0) return;
+
+    if (!ehUsuarioDoApp(data)) {
+      for (const t of uniqueUserTokens) blockedNonAppTokens.add(t);
+      return;
+    }
 
     usuariosMatch.push({
       uid: doc.id,
@@ -572,7 +579,7 @@ async function enviarPushInteligente({
     }
   }
 
-  const orphanTokens = tokensUnicos.filter((t) => !sentTokens.has(t));
+  const orphanTokens = tokensUnicos.filter((t) => !sentTokens.has(t) && !blockedNonAppTokens.has(t));
   if (orphanTokens.length > 0) {
     const rotaOrphan = obterRotaPadraoNotificacao(tipo, dados, false);
     sendPromises.push(
@@ -712,12 +719,13 @@ function usuarioDocBateComNome(userDoc, alvoNome, codigoOuId = null) {
 }
 
 function resolverUsuarioNaLista(usuariosDb, alvoNome, codigoOuId = null) {
+  const listaApp = (Array.isArray(usuariosDb) ? usuariosDb : []).filter((u) => ehUsuarioDoApp(u));
   if (codigoOuId && codigoOuId !== 'admin') {
-    const porId = usuariosDb.find((u) => u.id === codigoOuId || u.codigo === codigoOuId);
+    const porId = listaApp.find((u) => u.id === codigoOuId || u.codigo === codigoOuId);
     if (porId) return porId;
   }
   if (!alvoNome) return null;
-  const exato = usuariosDb.find((u) => usuarioDocBateComNome(u, alvoNome, null));
+  const exato = listaApp.find((u) => usuarioDocBateComNome(u, alvoNome, null));
   return exato || null;
 }
 
@@ -841,7 +849,11 @@ async function emitirNotificacaoBackend({
   if (nomesAlvo.length === 0) return;
 
   const allUsers = [];
-  usuariosSnap.forEach((d) => allUsers.push({ id: d.id, ...d.data() }));
+  usuariosSnap.forEach((d) => {
+    const data = d.data();
+    if (!ehUsuarioDoApp(data)) return;
+    allUsers.push({ id: d.id, ...data });
+  });
 
   const batch = db.batch();
   const tokensSet = new Set();
@@ -941,6 +953,13 @@ function registerNotificationActionRoutes({
       }
 
       const userData = { id: userSnap.id, ...userSnap.data() };
+      if (!ehUsuarioDoApp(userData)) {
+        return res.status(403).json({
+          ok: false,
+          titulo: 'Acesso negado',
+          mensagem: 'Este usuário não possui acesso ao aplicativo.'
+        });
+      }
       const isAdmin = userData.admin === true;
       const nomeAtor = obterNomePadraoUsuario(userData, 'Usuário');
 
@@ -1117,7 +1136,9 @@ function registerNotificationActionRoutes({
           }
 
           const usuariosSnap = await db.collection('usuarios').get();
-          const usuariosDb = usuariosSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          const usuariosDb = usuariosSnap.docs
+            .map((d) => ({ id: d.id, ...d.data() }))
+            .filter((u) => ehUsuarioDoApp(u));
 
           const userSolic = resolverUsuarioNaLista(
             usuariosDb,
@@ -1523,14 +1544,17 @@ async function emitNotificationTrocaDiretaAceita({
 module.exports = {
   CANAIS_NOTIFICACAO,
   INVALID_FCM_ERROR_CODES,
+  ehUsuarioDoApp,
   obterEstiloNotificacao,
   obterRotaPadraoNotificacao,
   resolverSigningSecret,
   gerarActionToken,
   verificarActionToken,
   montarAcoesParaUsuario,
+  resolverUsuarioNaLista,
   extrairTokensInvalidosDeResposta,
   podarTokensInvalidos,
   enviarPushInteligente,
+  emitirNotificacaoBackend,
   registerNotificationActionRoutes
 };

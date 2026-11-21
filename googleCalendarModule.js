@@ -43,6 +43,12 @@ function normalizarTexto(str) {
     .trim();
 }
 
+function ehUsuarioDoApp(userData) {
+  if (!userData || typeof userData !== 'object') return false;
+  if (userData.acessoApp === false) return false;
+  return String(userData.role || '').trim().toLowerCase() !== 'membro';
+}
+
 function isGoogleOAuthConfigured() {
   return Boolean(
     typeof process.env.GOOGLE_CLIENT_ID === 'string' &&
@@ -256,6 +262,7 @@ function resolverNomeEscalado(rawName, usuarios = []) {
   const texto = String(rawName || '').trim();
   if (!texto) return '';
   for (const u of usuarios || []) {
+    if (!ehUsuarioDoApp(u)) continue;
     const ids = gerarIdentificadoresUsuario(u);
     if (usuarioBateComNome(ids, texto)) {
       const formatado = formatarNomeEscalado(u);
@@ -720,18 +727,19 @@ function construirEventosParaUsuario({
 async function resolveUsuarioDoc(db, decodedUser) {
   const byUidRef = db.collection('usuarios').doc(decodedUser.uid);
   const byUidSnap = await byUidRef.get();
-  if (byUidSnap.exists) {
+  if (byUidSnap.exists && ehUsuarioDoApp(byUidSnap.data())) {
     return { ref: byUidRef, id: byUidSnap.id, data: byUidSnap.data() };
   }
   if (decodedUser.email) {
     const byEmailSnap = await db
       .collection('usuarios')
       .where('email', '==', decodedUser.email)
-      .limit(1)
       .get();
     if (!byEmailSnap.empty) {
-      const doc = byEmailSnap.docs[0];
-      return { ref: doc.ref, id: doc.id, data: doc.data() };
+      const doc = byEmailSnap.docs.find((d) => ehUsuarioDoApp(d.data()));
+      if (doc) {
+        return { ref: doc.ref, id: doc.id, data: doc.data() };
+      }
     }
   }
   return null;
@@ -902,7 +910,11 @@ async function carregarSnapshotAgenda(db, { precisarAvisos, precisarTesouraria }
   return {
     tarefas: snapTarefas ? snapTarefas.docs.map((d) => ({ id: d.id, ...d.data() })) : [],
     eventos: snapEventos ? snapEventos.docs.map((d) => ({ id: d.id, ...d.data() })) : [],
-    usuarios: snapUsuarios ? snapUsuarios.docs.map((d) => ({ id: d.id, ...d.data() })) : [],
+    usuarios: snapUsuarios
+      ? snapUsuarios.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .filter((u) => ehUsuarioDoApp(u))
+      : [],
     avisos: snapAvisos ? snapAvisos.docs.map((d) => ({ id: d.id, ...d.data() })) : [],
     transacoesPendentes: snapTx ? snapTx.docs.map((d) => ({ id: d.id, ...d.data() })) : []
   };
@@ -916,6 +928,9 @@ function registerGoogleCalendarRoutes({
   getBrazilDateOffset
 }) {
   async function sincronizarUsuario(db, userDocId, userData, userRef, sharedSnapshot = null) {
+    if (!ehUsuarioDoApp(userData)) {
+      return { ignorado: true, motivo: 'Usuário sem acesso ao aplicativo.' };
+    }
     const gc = userData?.googleCalendar || {};
     if (!gc.connected || gc.enabled === false) {
       return { ignorado: true, motivo: 'Integração desconectada ou desativada.' };
@@ -1377,6 +1392,7 @@ function registerGoogleCalendarRoutes({
     const alvos = [];
     snapUsuarios.forEach((doc) => {
       const u = doc.data();
+      if (!ehUsuarioDoApp(u)) return;
       const gc = u.googleCalendar || {};
       if (!gc.connected || gc.enabled === false) return;
 
@@ -1527,6 +1543,7 @@ function registerGoogleCalendarRoutes({
       const alvos = [];
       snapUsuarios.forEach((doc) => {
         const u = doc.data();
+        if (!ehUsuarioDoApp(u)) return;
         if (u.googleCalendar?.connected && u.googleCalendar?.enabled !== false) {
           alvos.push({ id: doc.id, data: u, ref: doc.ref });
         }
@@ -1570,6 +1587,8 @@ function registerGoogleCalendarRoutes({
 
 module.exports = {
   registerGoogleCalendarRoutes,
+  ehUsuarioDoApp,
+  carregarSnapshotAgenda,
   getUserCapabilities,
   gerarIdentificadoresUsuario,
   usuarioBateComNome,

@@ -2,7 +2,7 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
-const { registerGoogleCalendarRoutes } = require('./googleCalendarModule');
+const { registerGoogleCalendarRoutes, ehUsuarioDoApp } = require('./googleCalendarModule');
 const {
   obterEstiloNotificacao,
   resolverSigningSecret,
@@ -89,10 +89,10 @@ const FIRESTORE_BATCH_LIMIT = 450;
 const ISO_DATE_REGEX = /^(\d{4})-(\d{2})-(\d{2})$/;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
-// Espelha hasTesourariaPrivilege de firestore.rules
+// Espelha hasTesourariaPrivilege de firestore.rules (somente usuários do app)
 function hasTesourariaPrivilege(userData) {
   return Boolean(
-    userData &&
+    ehUsuarioDoApp(userData) &&
     (userData.admin === true ||
       userData.tesouraria === true ||
       (typeof userData.role === 'string' && /pastor|tesoureir/i.test(userData.role)))
@@ -305,7 +305,7 @@ async function verificarAutorizacaoCron(req, res, next) {
     try {
       const decoded = await admin.auth().verifyIdToken(bearerToken);
       const userSnap = await admin.firestore().collection('usuarios').doc(decoded.uid).get();
-      if (userSnap.exists && userSnap.data()?.admin === true) {
+      if (userSnap.exists && ehUsuarioDoApp(userSnap.data()) && userSnap.data()?.admin === true) {
         req.user = decoded;
         req.isAdmin = true;
         return next();
@@ -437,6 +437,7 @@ async function carregarMapaUsuarios(db) {
 
   snapUsuarios.forEach((doc) => {
     const data = doc.data();
+    if (!ehUsuarioDoApp(data)) return;
     const tokens = obterTokensDoUsuario(data);
 
     if (hasTesourariaPrivilege(data)) {
@@ -1046,7 +1047,9 @@ if (require.main === module) {
 
 module.exports = {
   app,
+  ehUsuarioDoApp,
   hasTesourariaPrivilege,
+  carregarMapaUsuarios,
   diffDiasCalendario,
   avaliarMarcoLembreteTesouraria,
   formatarValorBRL,
