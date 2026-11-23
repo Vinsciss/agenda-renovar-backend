@@ -301,6 +301,13 @@ function getEndOfWeekISO(isoDate) {
   return `${yy}-${mm}-${dd}`;
 }
 
+function isTarefaLimpeza(t) {
+  if (!t || typeof t !== 'object') return false;
+  const nome = String(t.nome || '').trim().toLowerCase();
+  const evNome = String(t.eventoNome || '').trim().toLowerCase();
+  return nome === 'limpar a igreja' || evNome === 'limpar a igreja';
+}
+
 function tarefaEstaAtiva(t, minDateStr, maxDateStr) {
   if (!t || typeof t !== 'object') return false;
   if (t.prioridade === 'evento' || t.prioridade === 'importante') return false;
@@ -308,7 +315,7 @@ function tarefaEstaAtiva(t, minDateStr, maxDateStr) {
   if (maxDateStr && t.data > maxDateStr) return false;
   if (!minDateStr) return true;
   if (t.data >= minDateStr) return true;
-  if (t.nome === 'Limpar a Igreja') {
+  if (isTarefaLimpeza(t)) {
     return getEndOfWeekISO(t.data) >= minDateStr;
   }
   return false;
@@ -346,6 +353,15 @@ function calcularHoraFim(isoDate, horaStr, duracaoMinutos = 120) {
   return {
     startDateTime: `${isoDate}T${match[1]}:${match[2]}:00-03:00`,
     endDateTime: `${ey}-${em}-${ed}T${eh}:${emin}:00-03:00`
+  };
+}
+
+function montarIntervaloSemanal(isoDate) {
+  if (!ISO_DATE_REGEX.test(isoDate)) return null;
+  const fimSemana = getEndOfWeekISO(isoDate);
+  return {
+    start: { date: isoDate },
+    end: { date: calcularProximoDiaISO(fimSemana) }
   };
 }
 
@@ -461,11 +477,13 @@ function construirEventosParaUsuario({
           data: evReal?.data || t.data,
           hora: evReal?.hora || t.hora || t.eventoHora || '',
           local: evReal?.local || '',
+          ehLimpeza: isTarefaLimpeza(t) || String(evReal?.nome || '').trim().toLowerCase() === 'limpar a igreja',
           linhasTarefas: [],
           minhasFuncoes: []
         });
       }
       const g = grupos.get(chave);
+      if (isTarefaLimpeza(t)) g.ehLimpeza = true;
       if (!g.hora) g.hora = evReal?.hora || t.hora || t.eventoHora || '';
       const nomeFuncao = t.nome || 'Função';
       const escalados = Array.isArray(t.usuarios) && t.usuarios.length > 0
@@ -481,7 +499,9 @@ function construirEventosParaUsuario({
     }
 
     for (const g of grupos.values()) {
-      const intervalo = montarIntervaloEvento(g.data, g.hora, false, 120);
+      const intervalo = g.ehLimpeza
+        ? montarIntervaloSemanal(g.data)
+        : montarIntervaloEvento(g.data, g.hora, false, 120);
       if (!intervalo) continue;
       const id = gerarEventIdGoogle(`admin_evento_${g.key}`);
       const estouEscalado = g.minhasFuncoes.length > 0;
@@ -492,7 +512,7 @@ function construirEventosParaUsuario({
       const descPartes = [
         estouEscalado ? `⭐ SUA TAREFA: ${g.minhasFuncoes.join(', ')}` : null,
         `Evento: ${g.eventoNome}`,
-        g.hora ? `Horário: ${g.hora}` : null,
+        g.ehLimpeza ? 'Duração: Semanal (Segunda a Domingo)' : (g.hora ? `Horário: ${g.hora}` : null),
         g.local ? `Local: ${g.local}` : null,
         g.linhasTarefas.length > 0 ? `\nEscalados:\n${g.linhasTarefas.join('\n')}` : null,
         '\nSincronizado automaticamente pelo Agenda Renovar (Modo Completo).'
@@ -532,24 +552,28 @@ function construirEventosParaUsuario({
           data: evData,
           hora: evHora,
           local: evReal?.local || '',
+          ehLimpeza: isTarefaLimpeza(t) || String(evReal?.nome || '').trim().toLowerCase() === 'limpar a igreja',
           funcoes: []
         });
       }
       const g = gruposPessoais.get(chave);
+      if (isTarefaLimpeza(t)) g.ehLimpeza = true;
       if (t.nome && !g.funcoes.includes(t.nome)) {
         g.funcoes.push(t.nome);
       }
     }
 
     for (const g of gruposPessoais.values()) {
-      const intervalo = montarIntervaloEvento(g.data, g.hora, false, 120);
+      const intervalo = g.ehLimpeza
+        ? montarIntervaloSemanal(g.data)
+        : montarIntervaloEvento(g.data, g.hora, false, 120);
       if (!intervalo) continue;
       const id = gerarEventIdGoogle(`minha_escala_${g.key}`);
       const funcoesStr = g.funcoes.join(', ') || 'Escala';
       const desc = [
         `⭐ Sua tarefa: ${funcoesStr}`,
         `Evento: ${g.eventoNome}`,
-        g.hora ? `Horário: ${g.hora}` : null,
+        g.ehLimpeza ? 'Duração: Semanal (Segunda a Domingo)' : (g.hora ? `Horário: ${g.hora}` : null),
         g.local ? `Local: ${g.local}` : null,
         '\nSincronizado automaticamente pelo Agenda Renovar.'
       ]
