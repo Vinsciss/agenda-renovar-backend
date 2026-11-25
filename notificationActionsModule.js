@@ -87,8 +87,8 @@ function obterEstiloNotificacao(tipo) {
     return { channelId: CANAIS_NOTIFICACAO.TESOURARIA, color: '#E11D48', priority: 'high' };
   }
 
-  if (['aviso-novo', 'aviso_geral'].includes(t)) {
-    return { channelId: CANAIS_NOTIFICACAO.AVISOS, color: '#6366F1', priority: 'high' };
+  if (['aviso-novo', 'aviso_geral', 'comunidade-post', 'comunidade-interacao', 'comunidade-acesso-membro'].includes(t)) {
+    return { channelId: CANAIS_NOTIFICACAO.AVISOS, color: '#E64F0E', priority: 'high' };
   }
 
   return { channelId: CANAIS_NOTIFICACAO.AVISOS, color: '#6366F1', priority: 'high' };
@@ -128,6 +128,16 @@ function obterRotaPadraoNotificacao(tipo, dados = {}, isAdmin = false) {
     return txId
       ? `/admin/tesouraria?filtro=pendentes&tx=${encodeURIComponent(txId)}`
       : '/admin/tesouraria?filtro=pendentes';
+  }
+
+  if (t === 'comunidade-interacao' || t === 'comunidade-acesso-membro') {
+    if (isRotaSegura(dados?.rota)) return dados.rota;
+    return '/admin/comunidade';
+  }
+
+  if (t === 'comunidade-post') {
+    if (isRotaSegura(dados?.rota)) return dados.rota;
+    return dados?.postId ? `/comunidade/post/${encodeURIComponent(dados.postId)}` : '/comunidade';
   }
 
   if (t === 'swap-info-admin' || t === 'troca_info_admin') {

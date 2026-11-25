@@ -45,6 +45,7 @@ function normalizarTexto(str) {
 
 function ehUsuarioDoApp(userData) {
   if (!userData || typeof userData !== 'object') return false;
+  if (userData.acessoApp === true) return true;
   if (userData.acessoApp === false) return false;
   return String(userData.role || '').trim().toLowerCase() !== 'membro';
 }

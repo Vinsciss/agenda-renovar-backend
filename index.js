@@ -35,12 +35,15 @@ const app = express();
 
 // 🌐 CORS restrito às origens conhecidas do app (permite chamadas sem Origin como crons/servidor)
 const DEFAULT_ALLOWED_ORIGINS = [
+  'https://igrejarenovaremcristo.com.br',
+  'https://www.igrejarenovaremcristo.com.br',
   'https://agenda-renovar.web.app',
   'https://agenda-renovar.firebaseapp.com',
   'capacitor://localhost',
   'https://localhost',
   'http://localhost',
-  'http://localhost:5173'
+  'http://localhost:5173',
+  'http://localhost:4173'
 ];
 
 const extraAllowedOrigins = (process.env.ALLOWED_ORIGINS || '')
@@ -1024,6 +1027,8 @@ const gcalModule = registerGoogleCalendarRoutes({
   getBrazilDateOffset
 });
 
+const { registerComunidadeRoutes } = require('./comunidadeRoutesModule');
+
 registerNotificationActionRoutes({
   app,
   admin,
@@ -1032,6 +1037,14 @@ registerNotificationActionRoutes({
   sanitizarDadosFCM,
   sincronizarGoogleCalendarAfetados: gcalModule?.sincronizarAfetadosInterno,
   signingSecret: ACTION_SIGNING_SECRET
+});
+
+registerComunidadeRoutes({
+  app,
+  admin,
+  verificarAutenticacao,
+  enviarMulticastEmLotes,
+  sanitizarDadosFCM
 });
 
 app.get('/', (req, res) => {
